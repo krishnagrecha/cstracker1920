@@ -306,6 +306,19 @@
         const STORAGE_KEY = 'study_schedule_vibrant_sept_oct_v3';
         const BACKUP_KEY = STORAGE_KEY + '_recovery_backups_v1';
         const MAX_LOCAL_BACKUPS = 30;
+        // Stable serialization avoids false conflicts caused by Firestore map-key ordering.
+        // A queue serializes rapid consecutive saves.
+        let saveQueue = Promise.resolve();
+
+        function stableStringify(value) {
+            if (Array.isArray(value)) return '[' + value.map(stableStringify).join(',') + ']';
+            if (value && typeof value === 'object') {
+                return '{' + Object.keys(value).sort().map(key =>
+                    JSON.stringify(key) + ':' + stableStringify(value[key])
+                ).join(',') + '}';
+            }
+            return JSON.stringify(value);
+        }
         let lastCloudSnapshot = null;
         let cloudReady = false;
         const PUBLIC_DOC_ID = 'global_revision_plan'; // The shared document ID
@@ -430,7 +443,7 @@
                 if (docSnap.exists()) {
                     const incoming = docSnap.data().tasks || [];
                     // Keep an independent baseline for detecting stale-tab writes.
-                    lastCloudSnapshot = JSON.stringify(incoming);
+                    lastCloudSnapshot = stableStringify(incoming);
                     cloudReady = true;
                     scheduleData = incoming;
                     saveLocalRecoveryCopy(incoming, 'cloud-sync');
@@ -506,7 +519,14 @@
             } catch (e) { alert('Could not restore backup: ' + e.message); }
         }
 
-        async function saveData(showFeedback = true, forceRestore = false) {
+        function saveData(showFeedback = true, forceRestore = false) {
+            // Serialize consecutive saves so rapid edits don't race each other.
+            const queued = saveQueue.then(() => performSaveData(showFeedback, forceRestore));
+            saveQueue = queued.catch(error => console.error('Queued save failed:', error));
+            return queued;
+        }
+
+        async function performSaveData(showFeedback = true, forceRestore = false) {
             // Preserve the pre-change state locally before every write.
             saveLocalRecoveryCopy(scheduleData, 'pre-write');
             if (useCloud && db) {
@@ -519,7 +539,7 @@
                     // Avoid silently overwriting a newer version written by another tab/device.
                     if (cloudReady && lastCloudSnapshot !== null && !forceRestore) {
                         const fresh = await getDoc(docRef);
-                        const remote = fresh.exists() ? JSON.stringify(fresh.data().tasks || []) : null;
+                        const remote = fresh.exists() ? stableStringify(fresh.data().tasks || []) : null;
                         if (remote !== lastCloudSnapshot) {
                             showToast('Conflict detected — reload before saving');
                             alert('Another tab/device changed the tracker. Your change was not uploaded to avoid overwriting newer progress. Download a backup now, then reload the page and reapply your change.');
@@ -527,7 +547,7 @@
                         }
                     }
                     await setDoc(docRef, { tasks: scheduleData, updatedAt: new Date().toISOString() });
-                    lastCloudSnapshot = JSON.stringify(scheduleData);
+                    lastCloudSnapshot = stableStringify(scheduleData);
                     cloudReady = true;
                     updateStats();
                     if (showFeedback) showToast('Cloud synced ☁️');
