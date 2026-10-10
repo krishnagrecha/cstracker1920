@@ -118,6 +118,9 @@
                         <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6zM6 20V4h7v5h5v11H6z"/><path d="M8.5 13.5l1.8 2.5-1.8 2.5h1.5l1-1.6 1 1.6h1.5l-1.8-2.5 1.8-2.5h-1.5l-1 1.6-1-1.6z"/></svg>
                         Export Excel
                     </button>
+                    <button id="btn-export-backup" class="flex items-center gap-2 px-4 py-3 bg-sky-500 hover:bg-sky-600 text-white text-xs sm:text-sm font-black rounded-2xl shadow-lg transition">Download Backup</button>
+                    <button id="btn-import-backup" class="flex items-center gap-2 px-4 py-3 bg-white/20 hover:bg-white/30 text-white text-xs sm:text-sm font-black rounded-2xl transition">Restore Backup</button>
+                    <input id="backup-file-input" type="file" accept="application/json,.json" class="hidden">
                     <button id="btn-add-row" class="flex items-center gap-2 px-4 py-3 bg-amber-400 hover:bg-amber-300 text-amber-950 text-xs sm:text-sm font-black rounded-2xl shadow-lg shadow-amber-400/20 active:scale-95 transition duration-150">
                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M12 4v16m8-8H4"/></svg>
                         Add Task
@@ -286,7 +289,7 @@
     <script type="module">
         // 1. IMPORT FIREBASE (No Authentication Needed)
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-        import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getFirestore, doc, setDoc, getDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // 2. YOUR FIREBASE CONFIGURATION GOES HERE
         // Paste the block from Step 2 of the guide right here!
@@ -301,6 +304,10 @@
         };
 
         const STORAGE_KEY = 'study_schedule_vibrant_sept_oct_v3';
+        const BACKUP_KEY = STORAGE_KEY + '_recovery_backups_v1';
+        const MAX_LOCAL_BACKUPS = 30;
+        let lastCloudSnapshot = null;
+        let cloudReady = false;
         const PUBLIC_DOC_ID = 'global_revision_plan'; // The shared document ID
 
         const SUBJECTS_CONFIG = [
@@ -421,12 +428,19 @@
 
             onSnapshot(docRef, (docSnap) => {
                 if (docSnap.exists()) {
-                    scheduleData = docSnap.data().tasks || [];
+                    const incoming = docSnap.data().tasks || [];
+                    // Keep an independent baseline for detecting stale-tab writes.
+                    lastCloudSnapshot = JSON.stringify(incoming);
+                    cloudReady = true;
+                    scheduleData = incoming;
+                    saveLocalRecoveryCopy(incoming, 'cloud-sync');
                     renderTable();
                     updateStats();
                 } else {
                     scheduleData = generateInitialData();
-                    saveData(false); 
+                    lastCloudSnapshot = null;
+                    cloudReady = true;
+                    saveData(false);
                 }
             }, (error) => {
                 console.error("Firestore sync error:", error);
@@ -452,26 +466,83 @@
             updateStats();
         }
 
-        async function saveData(showFeedback = true) {
+        function saveLocalRecoveryCopy(data = scheduleData, reason = 'before-save') {
+            try {
+                const copy = JSON.parse(JSON.stringify(data));
+                const backups = JSON.parse(localStorage.getItem(BACKUP_KEY) || '[]');
+                backups.unshift({ savedAt: new Date().toISOString(), reason, tasks: copy });
+                localStorage.setItem(BACKUP_KEY, JSON.stringify(backups.slice(0, MAX_LOCAL_BACKUPS)));
+                // Keep a separate latest local copy even while cloud sync is available.
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(copy));
+            } catch (e) { console.warn('Local recovery copy could not be saved:', e); }
+        }
+
+        function downloadJSON(data, filename) {
+            const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a'); a.href = url; a.download = filename;
+            document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+        }
+
+        function exportBackup() {
+            if (!Array.isArray(scheduleData) || !scheduleData.length) { showToast('No task data to export'); return; }
+            saveLocalRecoveryCopy(scheduleData, 'manual-export');
+            downloadJSON({ app: 'Revision Master Plan', exportedAt: new Date().toISOString(), projectId: firebaseConfig.projectId, documentId: PUBLIC_DOC_ID, tasks: scheduleData }, `revision-tracker-backup-${new Date().toISOString().slice(0,10)}.json`);
+            showToast('Backup downloaded');
+        }
+
+        async function importBackupFile(file) {
+            try {
+                const parsed = JSON.parse(await file.text());
+                const tasks = Array.isArray(parsed) ? parsed : parsed.tasks;
+                if (!Array.isArray(tasks) || !tasks.length || !tasks.every(t => t && Number.isFinite(Number(t.id)) && typeof t.status === 'string')) {
+                    throw new Error('This file does not contain a valid task array.');
+                }
+                if (!confirm(`Restore ${tasks.length} tasks from this backup? A safety copy of the current schedule will be made first.`)) return;
+                saveLocalRecoveryCopy(scheduleData, 'before-restore');
+                scheduleData = tasks.map(t => ({ ...t, id: Number(t.id) }));
+                renderTable(); updateStats();
+                await saveData(true);
+            } catch (e) { alert('Could not restore backup: ' + e.message); }
+        }
+
+        async function saveData(showFeedback = true, forceRestore = false) {
+            // Preserve the pre-change state locally before every write.
+            saveLocalRecoveryCopy(scheduleData, 'pre-write');
             if (useCloud && db) {
                 const docRef = doc(db, 'shared_trackers', PUBLIC_DOC_ID);
                 try {
-                    await setDoc(docRef, { tasks: scheduleData });
+                    if (!cloudReady && !forceRestore) {
+                        showToast('Sync is still loading. Please retry in a moment.');
+                        return;
+                    }
+                    // Avoid silently overwriting a newer version written by another tab/device.
+                    if (cloudReady && lastCloudSnapshot !== null && !forceRestore) {
+                        const fresh = await getDoc(docRef);
+                        const remote = fresh.exists() ? JSON.stringify(fresh.data().tasks || []) : null;
+                        if (remote !== lastCloudSnapshot) {
+                            showToast('Conflict detected — reload before saving');
+                            alert('Another tab/device changed the tracker. Your change was not uploaded to avoid overwriting newer progress. Download a backup now, then reload the page and reapply your change.');
+                            return;
+                        }
+                    }
+                    await setDoc(docRef, { tasks: scheduleData, updatedAt: new Date().toISOString() });
+                    lastCloudSnapshot = JSON.stringify(scheduleData);
+                    cloudReady = true;
                     updateStats();
-                    if (showFeedback) showToast("Cloud Synced ☁️");
+                    if (showFeedback) showToast('Cloud synced ☁️');
                 } catch (e) {
-                    console.error("Cloud save failed, falling back to local:", e);
+                    console.error('Cloud save failed:', e);
                     saveToLocal(showFeedback);
+                    showToast('Cloud save failed — local copy kept');
                 }
-            } else {
-                saveToLocal(showFeedback);
-            }
+            } else saveToLocal(showFeedback);
         }
 
         function saveToLocal(showFeedback) {
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(scheduleData));
+            saveLocalRecoveryCopy(scheduleData, 'local-save');
             updateStats();
-            if (showFeedback) showToast("Saved Locally");
+            if (showFeedback) showToast('Saved locally');
         }
 
         function updateStats() {
@@ -705,6 +776,9 @@
             document.getElementById('filter-status').addEventListener('change', renderTable);
 
             document.getElementById('btn-export-excel').addEventListener('click', exportToExcel);
+            document.getElementById('btn-export-backup').addEventListener('click', exportBackup);
+            document.getElementById('btn-import-backup').addEventListener('click', () => document.getElementById('backup-file-input').click());
+            document.getElementById('backup-file-input').addEventListener('change', e => { if (e.target.files[0]) importBackupFile(e.target.files[0]); e.target.value = ''; });
             document.getElementById('btn-add-row').addEventListener('click', addNewTask);
 
             document.getElementById('select-all-checkbox').addEventListener('change', (e) => {
@@ -743,13 +817,16 @@
             const resetModal = document.getElementById('reset-modal');
             document.getElementById('btn-reset').addEventListener('click', () => resetModal.classList.remove('hidden'));
             document.getElementById('modal-cancel').addEventListener('click', () => resetModal.classList.add('hidden'));
-            document.getElementById('modal-confirm').addEventListener('click', () => {
+            document.getElementById('modal-confirm').addEventListener('click', async () => {
+                if (!confirm('FINAL WARNING: This resets every task for every user. A local recovery copy will be saved, but download a JSON backup first if you want an independent copy. Continue?')) return;
+                saveLocalRecoveryCopy(scheduleData, 'before-reset');
+                downloadJSON({ app: 'Revision Master Plan', exportedAt: new Date().toISOString(), tasks: scheduleData }, `revision-tracker-before-reset-${new Date().toISOString().slice(0,10)}.json`);
                 selectedRowIds.clear();
                 scheduleData = generateInitialData();
-                saveData(true);
                 renderTable();
                 resetModal.classList.add('hidden');
-                showToast("Global Schedule Reset.");
+                await saveData(true);
+                showToast('Reset attempted; verify cloud sync status.');
             });
         }
 
